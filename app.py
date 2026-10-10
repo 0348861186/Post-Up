@@ -1,629 +1,173 @@
 import streamlit as st
 import pandas as pd
-import io
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-import numpy as np
+import requests
+import time
 import os
+from datetime import datetime
+import google.generativeai as genai
+from google.oauth2.service_account import Credentials
+import gspread
+from apscheduler.schedulers.background import BackgroundScheduler
 
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, KeepTogether
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+# --- CẤU HÌNH BIẾN MÔI TRƯỜNG (LẤY TỪ STREAMLIT SECRETS) ---
+# Tránh để lộ token trực tiếp trong code
+TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+FB_PAGE_ACCESS_TOKEN = st.secrets.get("FB_PAGE_ACCESS_TOKEN", "YOUR_FB_TOKEN")
+FB_PAGE_ID = st.secrets.get("FB_PAGE_ID", "YOUR_PAGE_ID")
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_GEMINI_KEY")
+GOOGLE_SHEETS_URL = st.secrets.get("GOOGLE_SHEETS_URL", "YOUR_SHEET_URL")
 
-# =========================
-# HELPER: BILINGUAL TEXT (STACKED)
-# =========================
-def tr(en, vi):
-    return f"{en}\n\n{vi}"
+# Cấu hình Google Credentials từ Streamlit Secrets
+google_creds_dict = st.secrets.get("gcp_service_account", None)
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(
-    page_title="Customer Complain Dashboard",
-    page_icon="📊",
-    layout="wide"
-)
+# --- KHỞI TẠO CÁC KẾT NỐI API ---
+genai.configure(api_key=GEMINI_API_KEY)
 
-st.title(tr(
-    "📊 CUSTOMER COMPLAIN DASHBOARD",
-    "📊 BẢNG ĐIỀU KHIỂN KHIẾU NẠI KHÁCH HÀNG"
-))
-st.markdown("---")
+def get_google_sheet():
+    if not google_creds_dict:
+        st.error("Chưa cấu hình tài khoản dịch vụ Google trong Secrets!")
+        return None
+    scopes = ["https://googleapis.com"]
+    creds = Credentials.from_service_account_info(google_creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_url(GOOGLE_SHEETS_URL).sheet1
+    return sheet
 
-# =========================
-# API KEY HANDLING (FIXED + DEBUG)
-# =========================
-st.sidebar.markdown(tr("### 🤖 SYSTEM CONFIG", "### 🤖 CẤU HÌNH HỆ THỐNG"))
+# --- HÀM XỬ LÝ CHỨC NĂNG CHÍNH ---
 
-api_key_sidebar = st.sidebar.text_input(
-    tr("API Key (optional)", "API Key (không bắt buộc)"),
-    type="password",
-    help=tr("Enter Google AI Studio API key", "Nhập API key từ Google AI Studio")
-)
-
-api_key = None
-
-if "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
-    st.sidebar.success("✔ API Key loaded từ secrets.toml")
-elif api_key_sidebar:
-    api_key = api_key_sidebar
-    st.sidebar.success("✔ API Key nhập từ sidebar")
-else:
-    st.sidebar.warning("⚠ Chưa có API_KEY")
-
-st.sidebar.caption(f"Debug API key status: {'OK' if api_key else 'MISSING'}")
-
-# =========================
-# UPLOAD FILE
-# =========================
-uploaded_files = st.sidebar.file_uploader(
-    tr("Upload Excel/CSV", "Tải lên Excel/CSV"),
-    type=["xlsx", "xls", "csv"],
-    accept_multiple_files=True
-)
-
-# =========================
-# PROCESS FILE
-# =========================
-def process_file_by_position(file):
-    if file.name.endswith(('.xlsx', '.xls')):
-        raw_df = pd.read_excel(file, header=None)
-    else:
-        raw_df = pd.read_csv(file, header=None)
-
-    start_row = 0
-    for idx, row in raw_df.iterrows():
-        row_str = row.astype(str).str.upper().str.strip().tolist()
-        if any('COMPLAIN' in str(cell) for cell in row_str):
-            start_row = idx + 1
-            break
-
-    df = raw_df.iloc[start_row:].copy()
-    df = df.iloc[:, :7]
-
-    df.columns = [
-        'COMPLAIN_DATE',
-        'WO_NUM',
-        'ITEM',
-        'ORDER_QTY',
-        'NG_QTY',
-        'TYPE_OF_DEFECT',
-        'FACILITY'
-    ]
-
-    return df.dropna(how='all')
-
-# =========================
-# LOAD DATA
-# =========================
-def load_data(files):
-    all_df = []
-
-    for file in files:
-        df = process_file_by_position(file)
-        df['SOURCE_FILE_NAME'] = file.name
-        all_df.append(df)
-
-    if not all_df:
-        return pd.DataFrame()
-
-    df = pd.concat(all_df, ignore_index=True)
-
-    df['COMPLAIN_DATE'] = pd.to_datetime(
-        df['COMPLAIN_DATE'],
-        format='%d/%m/%Y',
-        errors='coerce'
-    )
-
-    df = df.dropna(subset=['COMPLAIN_DATE'])
-
-    df['ORDER_QTY'] = pd.to_numeric(df['ORDER_QTY'], errors='coerce').fillna(0)
-    df['NG_QTY'] = pd.to_numeric(df['NG_QTY'], errors='coerce').fillna(0)
-    df['FACILITY'] = df['FACILITY'].astype(str).str.strip()
-    df['TYPE_OF_DEFECT'] = df['TYPE_OF_DEFECT'].astype(str).str.strip()
-
-    return df
-
-# =========================
-# PDF GENERATION HELPER (FIXED CHART TEXT OVERLAP)
-# =========================
-def generate_pdf_report(total_complains, total_ng, total_order, defect_rate, top_facility, top_defect, analysis_text, df_filtered):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-    story = []
-    
-    # Đăng ký font hỗ trợ tiếng Việt (DejaVuSans) từ matplotlib
+def generate_ai_content(topic):
+    """3) Gửi chủ đề sang Gemini AI để soạn nội dung"""
     try:
-        font_path = fm.findfont(fm.FontProperties(family='DejaVu Sans'))
-        pdfmetrics.registerFont(TTFont('UnicodeFont', font_path))
-        font_name = 'UnicodeFont'
-    except Exception:
-        font_name = 'Helvetica'
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'ReportTitle',
-        parent=styles['Heading1'],
-        fontName=font_name,
-        fontSize=14,
-        textColor=colors.HexColor('#1f77b4'),
-        spaceAfter=3,
-        alignment=1
-    )
-    
-    subtitle_style = ParagraphStyle(
-        'ReportSubTitle',
-        parent=styles['Normal'],
-        fontName=font_name,
-        fontSize=8.5,
-        textColor=colors.HexColor('#666666'),
-        spaceAfter=8,
-        alignment=1
-    )
-
-    heading_style = ParagraphStyle(
-        'SectionHeading',
-        parent=styles['Heading2'],
-        fontName=font_name,
-        fontSize=10.5,
-        textColor=colors.HexColor('#222222'),
-        spaceBefore=10,
-        spaceAfter=4
-    )
-    body_style = ParagraphStyle(
-        'ReportBody',
-        parent=styles['Normal'],
-        fontName=font_name,
-        fontSize=8,
-        leading=10.5,
-        textColor=colors.HexColor('#444444')
-    )
-
-    # Title
-    story.append(Paragraph("CUSTOMER COMPLAIN & QA/QC ANALYSIS REPORT", title_style))
-    story.append(Paragraph("BÁO CÁO PHÂN TÍCH KHIẾU NẠI KHÁCH HÀNG & QA/QC", subtitle_style))
-    story.append(Spacer(1, 2))
-
-    # KPI Table (Đã chuyển đơn vị sang pcs)
-    kpi_data = [
-        ['Total Complains / Tổng KN', str(total_complains), 'Defect Rate / Tỷ lệ lỗi', f"{defect_rate:.2f}%"],
-        ['Total NG / Tổng NG', f"{int(total_ng):,} pcs", 'Total Order / Tổng đặt', f"{int(total_order):,} pcs"],
-        ['Top Facility / NM chính', str(top_facility), 'Top Defect / Lỗi phổ biến', str(top_defect)]
-    ]
-    
-    kpi_table = Table(kpi_data, colWidths=[140, 120, 140, 124])
-    kpi_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f8f9fa')),
-        ('TEXTCOLOR', (0,0), (-1,-1), colors.HexColor('#333333')),
-        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-        ('FONTNAME', (0,0), (-1,-1), font_name),
-        ('FONTSIZE', (0,0), (-1,-1), 7.5),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#e0e0e0'))
-    ]))
-    story.append(kpi_table)
-    story.append(Spacer(1, 6))
-
-    story.append(Paragraph("Visual Analytics Dashboard / Phân tích trực quan", heading_style))
-
-    temp_files = []
-
-    try:
-        plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
-        
-        # CHART 1: Trend of Complains & NG Qty over Time
-        chart1_path = "temp_chart1.png"
-        temp_files.append(chart1_path)
-        df_trend = df_filtered.groupby(df_filtered['COMPLAIN_DATE'].dt.date).agg(
-            Complains=('WO_NUM', 'count'),
-            Total_NG=('NG_QTY', 'sum')
-        ).reset_index()
-
-        fig, ax1 = plt.subplots(figsize=(6.5, 2.0), dpi=150)
-        color = '#1f77b4'
-        ax1.set_xlabel('Date / Ngày', fontsize=7, fontname='DejaVu Sans')
-        ax1.set_ylabel('Complains / Số KN', color=color, fontsize=7, fontname='DejaVu Sans')
-        ax1.plot(df_trend['COMPLAIN_DATE'], df_trend['Complains'], color=color, marker='o', linewidth=1.2, label='Complains')
-        ax1.tick_params(axis='y', labelcolor=color, labelsize=6.5)
-        ax1.tick_params(axis='x', rotation=15, labelsize=6.5)
-
-        ax2 = ax1.twinx()  
-        color = '#ff7f0e'
-        ax2.set_ylabel('NG Quantity / Số lượng lỗi (pcs)', color=color, fontsize=7, fontname='DejaVu Sans')
-        ax2.plot(df_trend['COMPLAIN_DATE'], df_trend['Total_NG'], color=color, marker='s', linewidth=1.2, linestyle='--', label='NG Qty')
-        ax2.tick_params(axis='y', labelcolor=color, labelsize=6.5)
-        ax2.grid(False)
-
-        plt.title("Trend of Complains & NG Qty over Time / Xu hướng khiếu nại & số lượng lỗi", fontsize=7.5, fontweight='bold', fontname='DejaVu Sans')
-        plt.tight_layout()
-        plt.savefig(chart1_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        story.append(Image(chart1_path, width=490, height=150))
-        story.append(Spacer(1, 4))
-
-        # CHART 2: Defect Share (Pie)
-        chart2_path = "temp_chart2.png"
-        temp_files.append(chart2_path)
-        df_defect_share = df_filtered.groupby('TYPE_OF_DEFECT').size().reset_index(name='Count')
-        
-        fig, ax = plt.subplots(figsize=(6.5, 2.0), dpi=150)
-        colors_list = plt.cm.Paired(np.linspace(0, 1, len(df_defect_share)))
-        
-        wedges, texts, autotexts = ax.pie(
-            df_defect_share['Count'], 
-            labels=df_defect_share['TYPE_OF_DEFECT'], 
-            colors=colors_list, 
-            autopct='%1.1f%%', 
-            startangle=90, 
-            textprops={'fontsize': 5.5, 'fontname': 'DejaVu Sans'}
-        )
-        
-        for autotext in autotexts:
-            autotext.set_fontsize(5.0)
-
-        ax.axis('equal')
-        plt.title("Defect Type Share / Tỷ lệ loại lỗi", fontsize=7.5, fontweight='bold', fontname='DejaVu Sans')
-        plt.tight_layout()
-        plt.savefig(chart2_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        story.append(Image(chart2_path, width=490, height=150))
-        story.append(Spacer(1, 4))
-
-        # CHART 3: Facility & Defect
-        chart3_path = "temp_chart3.png"
-        temp_files.append(chart3_path)
-        df_facility_defect = df_filtered.groupby(['FACILITY', 'TYPE_OF_DEFECT']).size().unstack(fill_value=0)
-        
-        fig, ax = plt.subplots(figsize=(6.5, 2.2), dpi=150)
-        df_facility_defect.plot(kind='bar', stacked=True, ax=ax, colormap='tab10', width=0.55)
-        ax.set_title("Complains by Facility & Defect Type / Khiếu nại theo nhà máy & loại lỗi", fontsize=7.5, fontweight='bold', fontname='DejaVu Sans')
-        ax.set_xlabel("Facility / Nhà máy", fontsize=7, fontname='DejaVu Sans')
-        ax.set_ylabel("Complains / Số KN", fontsize=7, fontname='DejaVu Sans')
-        ax.tick_params(axis='x', rotation=0, labelsize=6.5)
-        ax.tick_params(axis='y', labelsize=6.5)
-        ax.legend(fontsize=6, title="Defect Type", title_fontsize=6.5, bbox_to_anchor=(1.01, 1), loc='upper left')
-        plt.tight_layout()
-        plt.savefig(chart3_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        story.append(Image(chart3_path, width=490, height=160))
-        story.append(Spacer(1, 4))
-
-        # CHART 4: NG Quantity by Facility
-        chart4_path = "temp_chart4.png"
-        temp_files.append(chart4_path)
-        df_facility_ng = df_filtered.groupby('FACILITY')['NG_QTY'].sum().reset_index(name='Total_NG').sort_values(by='Total_NG', ascending=True)
-        
-        fig, ax = plt.subplots(figsize=(6.5, 2.0), dpi=150)
-        ax.barh(df_facility_ng['FACILITY'], df_facility_ng['Total_NG'], color='#2ca02c', height=0.5)
-        ax.set_title("NG Quantity by Facility / Tổng lỗi NG theo nhà máy (pcs)", fontsize=7.5, fontweight='bold', fontname='DejaVu Sans')
-        ax.set_xlabel("Total NG Qty / Tổng số lượng NG (pcs)", fontsize=7, fontname='DejaVu Sans')
-        ax.set_ylabel("Facility / Nhà máy", fontsize=7, fontname='DejaVu Sans')
-        ax.tick_params(axis='both', labelsize=6.5)
-        plt.tight_layout()
-        plt.savefig(chart4_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        story.append(Image(chart4_path, width=490, height=150))
-        story.append(Spacer(1, 6))
-
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = f"Hãy viết một bài đăng Facebook hấp dẫn về chủ đề: '{topic}'. Nội dung ngắn gọn, thu hút, có sử dụng emoji phù hợp."
+        response = model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        print(f"Chart generation error: {e}")
+        return f"Lỗi tạo nội dung AI: {str(e)}"
 
-    # Analysis Section
-    story.append(Paragraph("Root Cause & Recommendations / Nguyên nhân gốc rễ & Giải pháp đề xuất", heading_style))
-    story.append(Spacer(1, 3))
-
-    for line in analysis_text.split('\n'):
-        if line.strip():
-            story.append(Paragraph(line.replace('**', ''), body_style))
-            story.append(Spacer(1, 2))
-
-    doc.build(story)
-    buffer.seek(0)
+def send_to_telegram_for_approval(post_id, topic, content, img_urls):
+    """4) Gửi lên Telegram để xem qua và duyệt bài"""
+    # Tạo các nút bấm Inline để duyệt nhanh qua Telegram
+    url = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
     
-    for p in temp_files:
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except:
-                pass
+    # Định dạng tin nhắn gửi đến Admin duyệt
+    message_text = (
+        f"📝 **YÊU CẦU DUYỆT BÀI ĐĂNG (Mã bài: {post_id})**\n\n"
+        f"📌 **Chủ đề:** {topic}\n\n"
+        f"✍️ **Nội dung AI soạn:**\n{content}\n\n"
+        f"🖼️ **Ảnh đi kèm:** {', '.join([u for u in img_urls if u])}\n"
+    )
+    
+    # Các nút Duyệt / Từ chối (Lưu ý: Bạn cần một webhook/server phụ để xử lý nút bấm này, 
+    # ở mức độ đơn giản trên Streamlit Cloud, ta sẽ duyệt thủ công trên giao diện Streamlit hoặc qua lệnh Bot)
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message_text,
+        "parse_mode": "Markdown"
+    }
+    requests.post(url, json=payload)
 
-    return buffer.getvalue()
+def publish_to_facebook(content, img_urls):
+    """6) Đăng lên Fanpage kèm 4 ảnh và Số điện thoại ở cuối"""
+    # Thêm số điện thoại cố định vào cuối bài đăng theo yêu cầu
+    final_content = f"{content}\n\n📞 Liên hệ: 0348861186"
+    
+    try:
+        # Bước 1: Upload từng ảnh lên Fanpage dưới dạng tạm ẩn (published=false) để lấy ID ảnh
+        media_ids = []
+        for url in img_urls:
+            if not url or not url.startswith("http"):
+                continue
+            upload_url = f"https://facebook.com{FB_PAGE_ID}/photos"
+            payload = {
+                'url': url,
+                'published': 'false',
+                'access_token': FB_PAGE_ACCESS_TOKEN
+            }
+            res = requests.post(upload_url, data=payload).json()
+            if 'id' in res:
+                media_ids.append(res['id'])
+        
+        if not media_ids:
+            return False, "Không có ảnh hợp lệ để đăng."
 
-
-# =========================
-# MAIN APP
-# =========================
-if uploaded_files:
-    df_raw = load_data(uploaded_files)
-
-    if not df_raw.empty:
-
-        if "view" not in st.session_state:
-            st.session_state.view = "ALL"
-
-        st.sidebar.markdown(tr("### View Mode", "### Chế độ xem"))
-
-        if st.sidebar.button("📋 ALL"):
-            st.session_state.view = "ALL"
-
-        for f in df_raw['SOURCE_FILE_NAME'].unique():
-            if st.sidebar.button(f"📄 {f}"):
-                st.session_state.view = f
-
-        df_filtered = df_raw.copy()
-
-        facility_filter = st.sidebar.multiselect(
-            tr("Facility", "Nhà máy"),
-            df_raw['FACILITY'].unique()
-        )
-
-        defect_filter = st.sidebar.multiselect(
-            tr("Defect Type", "Loại lỗi"),
-            df_raw['TYPE_OF_DEFECT'].unique()
-        )
-
-        if facility_filter:
-            df_filtered = df_filtered[df_filtered['FACILITY'].isin(facility_filter)]
-
-        if defect_filter:
-            df_filtered = df_filtered[df_filtered['TYPE_OF_DEFECT'].isin(defect_filter)]
-
-        if st.session_state.view != "ALL":
-            df_filtered = df_filtered[df_filtered['SOURCE_FILE_NAME'] == st.session_state.view]
-
-        # =========================
-        # KPI
-        # =========================
-        total_complains = len(df_filtered)
-        total_ng = df_filtered['NG_QTY'].sum()
-        total_order = df_filtered['ORDER_QTY'].sum()
-        defect_rate = (total_ng / total_order * 100) if total_order > 0 else 0
-
-        top_facility = df_filtered['FACILITY'].mode().iloc[0] if not df_filtered.empty else "N/A"
-        top_defect = df_filtered['TYPE_OF_DEFECT'].mode().iloc[0] if not df_filtered.empty else "N/A"
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-
-        c1.metric(tr("Total Complains", "Tổng khiếu nại"), total_complains)
-        c2.metric(tr("Defect Rate (%)", "Tỷ lệ lỗi (%)"), round(defect_rate, 2))
-        c3.metric(tr("Top Facility", "Nhà máy chính"), top_facility)
-        c4.metric(tr("Top Defect", "Lỗi phổ biến"), top_defect)
-        c5.metric(tr("Total NG", "Tổng NG"), f"{int(total_ng):,} pcs")
-
-        st.markdown("---")
-
-        # =========================
-        # VISUALIZATION
-        # =========================
-        st.subheader(tr(
-            "📊 Visual Analytics Dashboard",
-            "📊 Phân tích trực quan"
-        ))
-
-        if not df_filtered.empty:
-
-            chart_col1, chart_col2 = st.columns([2, 1])
-
-            with chart_col1:
-                st.markdown(tr(
-                    "**📈 Trend of Complains & NG Qty over Time**",
-                    "**📈 Xu hướng khiếu nại & số lượng lỗi theo thời gian**"
-                ))
-
-                df_trend = (
-                    df_filtered
-                    .groupby(df_filtered['COMPLAIN_DATE'].dt.date)
-                    .agg(
-                        Complains=('WO_NUM', 'count'),
-                        Total_NG=('NG_QTY', 'sum')
-                    )
-                    .reset_index()
-                )
-
-                fig_trend = make_subplots(specs=[[{"secondary_y": True}]])
-
-                fig_trend.add_trace(
-                    go.Scatter(
-                        x=df_trend['COMPLAIN_DATE'],
-                        y=df_trend['Complains'],
-                        name="Complains",
-                        mode="lines+markers"
-                    ),
-                    secondary_y=False
-                )
-
-                fig_trend.add_trace(
-                    go.Scatter(
-                        x=df_trend['COMPLAIN_DATE'],
-                        y=df_trend['Total_NG'],
-                        name="NG Qty (pcs)",
-                        mode="lines+markers"
-                    ),
-                    secondary_y=True
-                )
-
-                fig_trend.update_layout(
-                    template="plotly_white",
-                    height=350,
-                    margin=dict(l=20, r=20, t=20, b=20),
-                    legend=dict(orientation="h")
-                )
-
-                fig_trend.update_yaxes(title_text="Complains", secondary_y=False)
-                fig_trend.update_yaxes(title_text="NG Quantity (pcs)", secondary_y=True)
-                fig_trend.update_xaxes(title_text="Date")
-
-                st.plotly_chart(fig_trend, use_container_width=True)
-
-            with chart_col2:
-                st.markdown(tr(
-                    "**🍕 Defect Type Share**",
-                    "**🍕 Tỷ lệ loại lỗi**"
-                ))
-
-                df_defect_share = (
-                    df_filtered.groupby('TYPE_OF_DEFECT')
-                    .size()
-                    .reset_index(name='Count')
-                )
-
-                fig_pie = px.pie(
-                    df_defect_share,
-                    values='Count',
-                    names='TYPE_OF_DEFECT',
-                    hole=0.4,
-                    template="plotly_white"
-                )
-
-                fig_pie.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
-                st.plotly_chart(fig_pie, use_container_width=True)
-
-            chart_col3, chart_col4 = st.columns(2)
-
-            with chart_col3:
-                st.markdown(tr(
-                    "**🏢 Complains by Facility & Defect Type**",
-                    "**🏢 Khiếu nại theo nhà máy & loại lỗi**"
-                ))
-
-                df_facility_defect = (
-                    df_filtered.groupby(['FACILITY', 'TYPE_OF_DEFECT'])
-                    .size()
-                    .reset_index(name='Complains')
-                )
-
-                fig_bar = px.bar(
-                    df_facility_defect,
-                    x='FACILITY',
-                    y='Complains',
-                    color='TYPE_OF_DEFECT',
-                    barmode='stack',
-                    template="plotly_white"
-                )
-
-                fig_bar.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
-                st.plotly_chart(fig_bar, use_container_width=True)
-
-            with chart_col4:
-                st.markdown(tr(
-                    "**⚠️ NG Quantity by Facility**",
-                    "**⚠️ Tổng lỗi NG theo nhà máy**"
-                ))
-
-                df_facility_ng = (
-                    df_filtered.groupby('FACILITY')['NG_QTY']
-                    .sum()
-                    .reset_index(name='Total_NG')
-                    .sort_values(by='Total_NG', ascending=True)
-                )
-
-                fig_hbar = px.bar(
-                    df_facility_ng,
-                    x='Total_NG',
-                    y='FACILITY',
-                    orientation='h',
-                    template="plotly_white"
-                )
-
-                fig_hbar.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
-                st.plotly_chart(fig_hbar, use_container_width=True)
-
+        # Bước 2: Tạo bài đăng đa ảnh (Multi-photo post) bằng cách nhóm các ID ảnh lại
+        feed_url = f"https://facebook.com{FB_PAGE_ID}/feed"
+        
+        attached_media = [{"media_fbid": m_id} for m_id in media_ids]
+        
+        payload = {
+            'message': final_content,
+            'attached_media': str(attached_media).replace("'", '"'), # Định dạng đúng chuẩn JSON array
+            'access_token': FB_PAGE_ACCESS_TOKEN
+        }
+        
+        result = requests.post(feed_url, data=payload).json()
+        if 'id' in result:
+            return True, result['id']
         else:
-            st.info(tr(
-                "No data available for charts",
-                "Không có dữ liệu để vẽ biểu đồ"
-            ))
+            return False, str(result)
+    except Exception as e:
+        return False, str(e)
 
-        st.markdown("---")
-
-        # =========================
-        # SYSTEM ANALYSIS SECTION
-        # =========================
-        st.subheader(tr(
-            "🔍 System Analytics & Insights",
-            "🔍 Phân tích & Thông tin chi tiết từ hệ thống"
-        ))
-
-        if st.button(tr("Run Analysis", "Chạy phân tích")):
-
-            if not api_key:
-                st.error("❌ Chưa có API_KEY")
-            else:
-                try:
-                    from google import genai
-                    client = genai.Client(api_key=api_key)
-
-                    sample_df = df_filtered.head(120)
-                    sample_data = sample_df.to_markdown(index=False)
-
-                    prompt = f"""
-Analyze the provided QA/QC dataset and metrics. Do not include any introductory remarks, greetings, or meta-commentary. Jump straight into the core findings.
-
-CRITICAL FORMATTING REQUIREMENTS:
-1. Every single point/bullet must start with a bullet point ('- ').
-2. For each point, output the English sentence first, followed immediately by its Vietnamese translation on the very next line (stacked style).
-3. STRICT RULE: Completely replace any mention of "units" or "đơn vị" with "pcs" across all numbers and quantities (e.g., write "3,178 pcs" instead of "3,178 đơn vị" or "3,178 units").
-
-SUMMARY KPI:
-- Complains: {total_complains}
-- NG Qty: {total_ng} pcs
-- Defect Rate: {defect_rate:.2f}%
-- Top Facility: {top_facility}
-- Top Defect: {top_defect}
-
-DATA EVIDENCE:
-{sample_data}
-"""
-
-                    response = client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=prompt
-                    )
-
-                    st.success(tr(
-                        "Analysis completed successfully",
-                        "Phân tích hoàn tất thành công"
-                    ))
-
-                    st.session_state['response_text'] = response.text
-
-                except Exception as e:
-                    st.error(f"Lỗi hệ thống: {e}")
-
-        if 'response_text' in st.session_state:
-            # Hiển thị kết quả phân tích theo dạng các dòng được định dạng rõ ràng
-            for line in st.session_state['response_text'].split('\n'):
-                if line.strip():
-                    st.markdown(line)
+def process_daily_job():
+    """Hàm chạy tự động vào đúng 9:00 AM"""
+    sheet = get_google_sheet()
+    if not sheet:
+        return
+    
+    records = sheet.get_all_records()
+    
+    # Tìm bài viết đầu tiên chưa có Trạng thái "Đã đăng" hoặc đang chờ duyệt
+    for i, row in enumerate(records, start=2): # Hàng 2 trong Sheets là dòng dữ liệu đầu tiên
+        status = str(row.get('Trạng thái', '')).strip()
+        
+        if status == "" or status.lower() == "chờ duyệt":
+            post_id = row.get('PostID')
+            topic = row.get('Chủ đề')
             
-            st.markdown("---")
+            # 5) Lấy link ảnh từ 4 cột trên cùng hàng ngang
+            img_urls = [
+                str(row.get('Ảnh 1', '')).strip(),
+                str(row.get('Ảnh 2', '')).strip(),
+                str(row.get('Ảnh 3', '')).strip(),
+                str(row.get('Ảnh 4', '')).strip()
+            ]
             
-            pdf_bytes = generate_pdf_report(
-                total_complains, total_ng, total_order, defect_rate, 
-                top_facility, top_defect, st.session_state['response_text'], df_filtered
-            )
+            # Chạy quy trình soạn bài
+            ai_text = generate_ai_content(topic)
             
-            st.download_button(
-                label=tr("📥 Download PDF Report", "📥 Tải xuống báo cáo PDF"),
-                data=pdf_bytes,
-                file_name="Customer_Complain_Analysis_Report.pdf",
-                mime="application/pdf"
-            )
+            # Cập nhật nội dung AI vào Sheet trước để lưu trữ
+            sheet.update_cell(i, 8, ai_text) # Cột H (Cột số 8) là 'Nội dung AI'
+            sheet.update_cell(i, 7, "Chờ duyệt trên Telegram") # Cột G (Cột số 7) là 'Trạng thái'
+            
+            # Gửi thông báo qua Telegram
+            send_to_telegram_for_approval(post_id, topic, ai_text, img_urls)
+            break # Mỗi ngày chỉ kích hoạt 1 bài lúc 9:00 AM
 
-        st.markdown(tr("### 📋 Data Table", "### 📋 Bảng dữ liệu"))
-        st.dataframe(df_filtered, use_container_width=True)
+# --- CẤU HÌNH TRÌNH KHỞI CHẠY TỰ ĐỘNG (9:00 AM) ---
+if 'scheduler_started' not in st.session_state:
+    scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
+    # 1) Đúng 9 giờ sáng kích hoạt đăng bài lên fanpage
+    scheduler.add_job(process_daily_job, 'cron', hour=9, minute=0)
+    scheduler.start()
+    st.session_state['scheduler_started'] = True
+
+# --- GIAO DIỆN QUẢN TRỊ TRÊN STREAMLIT ---
+st.set_page_config(page_title="Hệ thống đăng bài tự động", layout="wide")
+st.title("🤖 Hệ Thống Đăng Bài Fanpage Tự Động 9:00 AM")
+
+if st.button("⚡ Chạy kích hoạt thủ công ngay bây giờ (Test)"):
+    with st.spinner("Đang xử lý quy trình..."):
+        process_daily_job()
+    st.success("Đã chạy thử nghiệm quy trình! Kiểm tra Telegram/Google Sheets.")
+
+st.subheader("📊 Xem trạng thái hàng đợi dữ liệu từ Google Sheets")
+try:
+    sheet = get_google_sheet()
+    if sheet:
+        data = pd.DataFrame(sheet.get_all_records())
+        st.dataframe(data, use_container_width=True)
+except Exception as e:
+    st.warning("Điền cấu hình hợp lệ trong Secrets để xem bảng dữ liệu.")
