@@ -259,6 +259,39 @@ def post_to_facebook(content: str, photo_links: list[str]) -> dict[str, Any]:
         }
 
 
+# -------------------- HÀM THỰC THI ĐĂNG TRỰC TIẾP TỪ DASHBOARD --------------------
+
+def execute_publish_row(sheet, row_idx: int, custom_content: str | None = None) -> dict[str, Any]:
+    """
+    Hàm dùng chung để thực hiện đăng ngay 1 dòng bất kỳ lên Facebook từ Dashboard.
+    """
+    item = get_row_data(sheet, row_idx)
+    topic = item["topic"]
+    if not topic:
+        return {"ok": False, "error": "Dòng này không có chủ đề."}
+
+    # Đánh dấu trạng thái đang đăng để tránh bấm lặp
+    write_status(sheet, row_idx, STATUS_POSTING)
+
+    # Ưu tiên lấy nội dung chỉnh sửa trên form, sau đó đến nội dung cũ trên sheet, nếu chưa có thì gọi Gemini tạo mới
+    content = (custom_content or item["content"] or "").strip()
+    if not content:
+        try:
+            content = generate_post_content(topic)
+            sheet.update_cell(row_idx, COL_AI_CONTENT, content)
+        except Exception as e:
+            write_status(sheet, row_idx, STATUS_ERROR)
+            return {"ok": False, "error": f"Lỗi khi Gemini tạo nội dung: {e}"}
+
+    result = post_to_facebook(content, item["photos"])
+    if result["ok"]:
+        write_status(sheet, row_idx, STATUS_POSTED, content)
+    else:
+        write_status(sheet, row_idx, STATUS_ERROR)
+
+    return result
+
+
 # -------------------- DUYỆT BÀI QUA TELEGRAM BOT --------------------
 
 def telegram_bot_token() -> str:
@@ -274,7 +307,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not query.data:
         return
 
-    # Xác thực đúng người quản trị được cấu hình
     configured_chat = expected_chat_id()
     message_chat_id = str(query.message.chat_id) if query.message else ""
     if message_chat_id != configured_chat:
@@ -317,7 +349,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Bài viết chưa có nội dung AI.")
             return
 
-        # Đánh dấu trạng thái đang đăng để tránh bấm duyệt lặp lại
         write_status(sheet, row_idx, STATUS_POSTING)
         await query.edit_message_text(f"⏳ Đang tiến hành đăng bài dòng {row_idx} lên Fanpage...")
 
@@ -394,7 +425,6 @@ def daily_job():
             return
 
         row_idx, item = pending
-        # Khóa tạm dòng này để tránh xử lý trùng
         write_status(sheet, row_idx, STATUS_POSTING)
         try:
             content = generate_post_content(item["topic"])
@@ -504,7 +534,24 @@ top3.metric("Telegram Listener", "Đang chạy" if "telegram_thread" in locals()
 left, right = st.columns([1, 1])
 with left:
     st.subheader("🧪 Điều khiển thủ công")
-    if st.button("▶️ Chạy thử quy trình ngay (Test Run)", type="primary", use_container_width=True):
+    
+    # Nút 1: Đăng ngay dòng kế tiếp đang chờ (bỏ qua lịch 9h)
+    if st.button("⚡ Đăng ngay bài kế tiếp đang chờ xử lý", type="primary", use_container_width=True):
+        with st.spinner("Đang tìm bài chờ và đăng trực tiếp lên Facebook..."):
+            s = get_sheet()
+            pending = find_next_pending_row(s)
+            if not pending:
+                st.warning("Không có bài nào đang ở trạng thái 'Chờ xử lý'.")
+            else:
+                next_row_idx, _ = pending
+                res = execute_publish_row(s, next_row_idx)
+                if res["ok"]:
+                    st.success(f"🎉 Đã đăng thành công dòng {next_row_idx}! Post ID: {res['post_id']}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Đăng thất bại: {res['error']}")
+
+    if st.button("▶️ Chạy thử quy trình gửi Telegram (Test Run)", use_container_width=True):
         with st.spinner("Đang tìm bài, viết nội dung và gửi Telegram..."):
             daily_job()
         st.success("Đã hoàn tất! Vui lòng kiểm tra bot Telegram để duyệt bài.")
@@ -515,9 +562,8 @@ with left:
 
 with right:
     st.subheader("📌 Nguyên tắc hoạt động")
-    st.write("- Đúng **09:00**, lấy 1 dòng chưa đăng từ Google Sheets.")
-    st.write("- Gemini soạn nội dung kèm hotline **0348861186**.")
-    st.write("- Gửi bài sang Telegram. Chỉ khi bấm **✅ Duyệt**, bài kèm 4 ảnh mới được đăng lên Fanpage.")
+    st.write("- Đúng **09:00**, lấy 1 dòng chưa đăng gửi qua Telegram chờ duyệt.")
+    st.write("- Hoặc bạn có thể bấm **Đăng ngay bài kế tiếp** / chọn bài viết bên dưới rồi nhấn **Đăng bài này ngay** để đăng trực tiếp lên Facebook bất kỳ lúc nào.")
 
 st.divider()
 st.subheader("📋 Bảng quản lý bài đăng")
@@ -552,10 +598,10 @@ try:
             )
 
             row_options = {
-                f"Dòng {int(row['Dòng'])} — {row['Chủ đề'] or '(Chưa có chủ đề)'}": int(row["Dòng"])
+                f"Dòng {int(row['Dòng'])} — {row['Chủ đề'] or '(Chưa có chủ đề)'} [{row['Trạng thái'] or 'Chờ xử lý'}]": int(row["Dòng"])
                 for _, row in df.iterrows()
             }
-            selected_label = st.selectbox("Chọn bài viết để kiểm tra nội dung và 4 ảnh:", list(row_options.keys()))
+            selected_label = st.selectbox("Chọn bài viết để kiểm tra nội dung, 4 ảnh hoặc ĐĂNG NGAY:", list(row_options.keys()))
             selected_row_idx = row_options[selected_label]
             selected = get_row_data(sheet, selected_row_idx)
 
@@ -563,10 +609,12 @@ try:
             st.caption(f"Trạng thái: **{selected['status'] or 'Chưa xử lý'}**")
 
             st.markdown("#### Nội dung soạn thảo")
-            if selected["content"]:
-                st.text_area("Nội dung AI", value=selected["content"], height=250, key=f"content_{selected_row_idx}")
-            else:
-                st.info("Chưa có nội dung AI cho dòng này.")
+            post_content = st.text_area(
+                "Nội dung bài viết (Có thể chỉnh sửa trực tiếp trước khi nhấn Đăng):",
+                value=selected["content"],
+                height=250,
+                key=f"content_{selected_row_idx}"
+            )
 
             st.markdown("#### 🖼️ Xem trước 4 ảnh sau khi tự động bóc tách link")
             image_cols = st.columns(4)
@@ -582,5 +630,18 @@ try:
                             st.markdown(f"[Mở link ảnh]({url})")
                     else:
                         st.info("Chưa có URL ảnh")
+
+            st.write("")
+            # NÚT ĐĂNG BÀI NGAY DÀNH CHO DÒNG ĐANG CHỌN
+            col_btn1, col_btn2 = st.columns([1, 2])
+            with col_btn1:
+                if st.button(f"🚀 Đăng bài dòng {selected_row_idx} ngay lên Fanpage", type="primary", use_container_width=True):
+                    with st.spinner("Đang tiến hành đăng bài lên Fanpage..."):
+                        res = execute_publish_row(sheet, selected_row_idx, custom_content=post_content)
+                        if res["ok"]:
+                            st.success(f"🎉 Đã đăng thành công lên Fanpage! Post ID: {res['post_id']}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Đăng thất bại: {res['error']}")
 except Exception as exc:
     st.error(f"Lỗi khi đọc Google Sheets: {exc}")
