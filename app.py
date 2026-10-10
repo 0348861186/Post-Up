@@ -97,13 +97,16 @@ def get_gspread_client():
     if not service_account_info:
         raise RuntimeError("Thiếu mục [gcp_service_account] trong Secrets.")
 
+    info = dict(service_account_info)
+    # Tự động chuẩn hóa dấu xuống dòng của private key nếu bị escape nhầm
+    if "private_key" in info and isinstance(info["private_key"], str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = Credentials.from_service_account_info(
-        dict(service_account_info), scopes=scopes
-    )
+    credentials = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(credentials)
 
 
