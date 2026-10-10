@@ -1,7 +1,9 @@
 streamlit
-pandas
-requests
-google-generativeai
+google-genai
 gspread
 google-auth
+facebook-sdk
+requests
 apscheduler
+python-telegram-bot>=20.0
+pytz
