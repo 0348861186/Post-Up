@@ -9,7 +9,7 @@ import threading
 from datetime import datetime
 from typing import Any
 
-# Đảm bảo mã hóa UTF-8 cho môi trường chạy
+# Cấu hình UTF-8 cho môi trường
 os.environ["PYTHONUTF8"] = "1"
 
 import gspread
@@ -146,19 +146,17 @@ def get_row_data(sheet, row_idx: int) -> dict[str, Any]:
 
 def write_status(sheet, row_idx: int, status: str, content: str | None = None):
     """
-    Cập nhật trạng thái và nội dung bằng phương thức dải ô liên tục (G đến J)
-    để tối ưu số lần gọi API Google Sheets.
+    Cập nhật trạng thái và nội dung bằng batch update dải ô G:J 
+    để giảm số lần gọi Google Sheets API.
     """
-    # Lấy dữ liệu hiện tại của hàng để giữ nguyên các ô không thay đổi
     row_vals = sheet.row_values(row_idx)
     current_content = safe_cell(row_vals, COL_AI_CONTENT)
     current_posted_at = safe_cell(row_vals, COL_POSTED_AT)
 
     new_content = content if content is not None else current_content
     new_posted_at = now_string() if status == STATUS_POSTED else current_posted_at
-    col_i_val = safe_cell(row_vals, 9)  # Cột I (nếu có dữ liệu)
+    col_i_val = safe_cell(row_vals, 9)
 
-    # Cập nhật một lần cho dải ô G{row_idx}:J{row_idx}
     sheet.update(
         range_name=f"G{row_idx}:J{row_idx}",
         values=[[status, new_content, col_i_val, new_posted_at]]
@@ -197,7 +195,6 @@ Yêu cầu chi tiết:
         return text.strip()
         
     except Exception:
-        # Dự phòng gửi dạng Binary Part nếu môi trường gặp vấn đề encode
         from google.genai import types
         blob_prompt = types.Part.from_bytes(
             data=prompt.encode("utf-8", errors="surrogateescape"),
@@ -285,7 +282,7 @@ def post_to_facebook(content: str, photo_links: list[str]) -> dict[str, Any]:
         }
 
 
-# -------------------- HÀM THỰC THI ĐĂNG BÀI --------------------
+# -------------------- HÀM THỰC THI ĐĂNG TRỰC TIẾP --------------------
 
 def execute_publish_row(sheet, row_idx: int, custom_content: str | None = None) -> dict[str, Any]:
     item = get_row_data(sheet, row_idx)
@@ -407,11 +404,9 @@ async def send_telegram_approval(row_idx: int, topic: str, content: str, photo_l
     message_text = (
         f"🔔 YÊU CẦU DUYỆT BÀI — Dòng {row_idx}\n\n"
         f"📌 Chủ đề: {topic}\n\n"
-        f"📝 Nội dung:\n{content}\n\n"
-        f"🖼 Danh sách 4 ảnh:\n{photo_text or '(Chưa có link ảnh)'}"
+        f"📝 Nội dung do Gemini soạn:\n{content}\n\n"
+        f"🖼 Danh sách 4 ảnh (Direct Link):\n{photo_text or '(Chưa có link ảnh)'}"
     )
-    
-    # Cắt an toàn nếu nội dung vượt quá giới hạn 4096 ký tự của Telegram
     if len(message_text) > 4000:
         message_text = message_text[:3990] + "\n\n...(đã rút gọn)..."
 
@@ -428,7 +423,7 @@ async def send_telegram_approval(row_idx: int, topic: str, content: str, photo_l
     )
 
 
-# -------------------- HÀNG ĐỢI XỬ LÝ --------------------
+# -------------------- TIỆN ÍCH TÌM BÀI ĐANG CHỜ --------------------
 
 def find_next_pending_row(sheet) -> tuple[int, dict[str, Any]] | None:
     records = sheet.get_all_values()
@@ -441,8 +436,7 @@ def find_next_pending_row(sheet) -> tuple[int, dict[str, Any]] | None:
     return None
 
 
-def trigger_approval_job():
-    """Hàm tạo nội dung bằng Gemini và đẩy bài chờ sang Telegram để người dùng duyệt."""
+def trigger_approval_job() -> tuple[bool, str]:
     sheet = get_sheet()
     pending = find_next_pending_row(sheet)
     if not pending:
@@ -543,7 +537,7 @@ left, right = st.columns([1, 1])
 with left:
     st.subheader("🧪 Điều khiển tác vụ")
     
-    # Nút 1: Đăng trực tiếp bài tiếp theo lên Fanpage
+    # Nút 1: Đăng trực tiếp bài tiếp theo đang chờ lên Fanpage
     if st.button("⚡ Đăng trực tiếp bài kế tiếp lên Facebook", type="primary", use_container_width=True):
         with st.spinner("Đang tìm bài chờ và đăng trực tiếp lên Facebook..."):
             s = get_sheet()
@@ -559,7 +553,7 @@ with left:
                 else:
                     st.error(f"❌ Đăng thất bại: {res['error']}")
 
-    # Nút 2: Soạn bài và gửi sang Telegram để người dùng duyệt
+    # Nút 2: Soạn nội dung và gửi duyệt sang Telegram
     if st.button("📩 Tạo bài & Gửi duyệt qua Telegram", use_container_width=True):
         with st.spinner("Đang viết nội dung và gửi tin nhắn Telegram..."):
             ok, msg = trigger_approval_job()
@@ -576,7 +570,7 @@ with right:
     st.subheader("📌 Hướng dẫn sử dụng")
     st.write("- **Đăng trực tiếp:** Lấy dòng 'Chờ xử lý' đầu tiên, gọi Gemini viết bài và đẩy thẳng lên Facebook Fanpage.")
     st.write("- **Tạo bài & Gửi duyệt:** Gemini sẽ viết bài trước rồi gửi kèm 4 link ảnh sang Telegram. Khi bạn nhấn 'Duyệt & Đăng ngay' trên bot Telegram, bài viết mới được đăng lên Fanpage.")
-    st.write("- **Chỉnh sửa thủ công:** Chọn bài viết trong danh sách phía dưới để chỉnh sửa nội dung hoặc xem trước 4 ảnh.")
+    st.write("- **Chỉnh sửa thủ công:** Chọn bài viết trong danh sách bên dưới để chỉnh sửa lại nội dung hoặc xem trước 4 ảnh.")
 
 st.divider()
 st.subheader("📋 Bảng quản lý bài đăng")
