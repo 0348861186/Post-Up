@@ -91,8 +91,12 @@ def get_secret(name: str, default: Any = None) -> Any:
 def get_required_secret(name: str) -> str:
     value = get_secret(name)
     if value is None or not str(value).strip():
-        raise RuntimeError(f"Thiếu cấu hình '{name}'. Vui lòng bổ sung vào Secrets.")
-    return str(value).strip()
+        # Ép thông báo lỗi sang utf-8 phòng trường hợp ký tự lạ làm sập hệ thống
+        err_msg = f"Thiếu cấu hình '{name}'. Vui lòng bổ sung vào Secrets."
+        raise RuntimeError(err_msg.encode("utf-8", errors="ignore").decode("utf-8"))
+    
+    # Ép chuỗi cấu hình trả về luôn luôn tuân thủ mã hóa UTF-8 công khai
+    return str(value).strip().encode("utf-8", errors="ignore").decode("utf-8")
 
 
 def get_gspread_client():
