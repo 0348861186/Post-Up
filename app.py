@@ -163,9 +163,12 @@ def generate_post_content(topic: str) -> str:
     api_key = get_required_secret("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
+    # 1. Ép sạch dữ liệu đầu vào của chủ đề (topic) sang chuỗi UTF-8 chuẩn
+    topic_cleaned = str(topic).encode("utf-8", errors="ignore").decode("utf-8")
+
     prompt = f"""
 Bạn là chuyên gia sáng tạo nội dung cho Facebook Fanpage.
-Hãy viết một bài đăng bằng tiếng Việt về chủ đề: "{topic}".
+Hãy viết một bài đăng bằng tiếng Việt về chủ đề: "{topic_cleaned}".
 
 Yêu cầu chi tiết:
 - Tiêu đề thu hút, lôi cuốn nhưng chuẩn xác.
@@ -177,15 +180,37 @@ Yêu cầu chi tiết:
 - Không tự bịa thông tin khuyến mãi sai sự thật.
 - Chỉ trả về duy nhất nội dung bài đăng hoàn chỉnh.
 """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
-    text = getattr(response, "text", None)
-    if not text or not text.strip():
-        raise RuntimeError("Gemini không trả về nội dung.")
-    return text.strip()
 
+    try:
+        # Cách 1: Gửi chuỗi nội dung thông thường sau khi đã chuẩn hóa
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt.encode("utf-8", errors="ignore").decode("utf-8"),
+        )
+        text = getattr(response, "text", None)
+        if not text or not text.strip():
+            raise RuntimeError("Gemini không trả về nội dung.")
+        return text.strip()
+        
+    except (UnicodeEncodeError, Exception):
+        # Cách 2 (Tối cao): Nếu môi trường ASCII vẫn chặn dữ liệu chuỗi (String),
+        # Ta chuyển đổi nội dung Prompt thành định dạng nội dung thô (Part / Blob) bằng dữ liệu Byte (bytes)
+        # Cách này ép SDK Google xử lý nhị phân, không phụ thuộc vào bảng mã của máy tính.
+        from google.genai import types
+        
+        blob_prompt = types.Part.from_bytes(
+            data=prompt.encode("utf-8", errors="surrogateescape"),
+            mime_type="text/plain"
+        )
+        
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[blob_prompt],
+        )
+        text = getattr(response, "text", None)
+        if not text or not text.strip():
+            raise RuntimeError("Gemini không trả về nội dung.")
+        return text.strip()
 
 # -------------------- ĐĂNG BÀI LÊN FACEBOOK (4 ẢNH) --------------------
 
