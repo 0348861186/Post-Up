@@ -3,15 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
-import time
 from datetime import datetime
 from typing import Any
-# ---- CHÈN ĐOẠN NÀY VÀO ĐÂY ĐỂ SỬA LỖI ASCII CHỮ Đ ----
-import os
+
+# Đảm bảo mã hóa UTF-8 cho môi trường chạy
 os.environ["PYTHONUTF8"] = "1"
-# ----------------------------------------------------
+
 import gspread
 import pandas as pd
 import pytz
@@ -19,7 +19,6 @@ import requests
 import streamlit as st
 from google import genai
 from google.oauth2.service_account import Credentials
-from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -91,12 +90,9 @@ def get_secret(name: str, default: Any = None) -> Any:
 def get_required_secret(name: str) -> str:
     value = get_secret(name)
     if value is None or not str(value).strip():
-        # Ép thông báo lỗi sang utf-8 phòng trường hợp ký tự lạ làm sập hệ thống
         err_msg = f"Thiếu cấu hình '{name}'. Vui lòng bổ sung vào Secrets."
-        raise RuntimeError(err_msg.encode("utf-8", errors="ignore").decode("utf-8"))
-    
-    # Ép chuỗi cấu hình trả về luôn luôn tuân thủ mã hóa UTF-8 công khai
-    return str(value).strip().encode("utf-8", errors="ignore").decode("utf-8")
+        raise RuntimeError(err_msg)
+    return str(value).strip()
 
 
 def get_gspread_client():
@@ -105,7 +101,6 @@ def get_gspread_client():
         raise RuntimeError("Thiếu mục [gcp_service_account] trong Secrets.")
 
     info = dict(service_account_info)
-    # Tự động chuẩn hóa dấu xuống dòng của private key nếu bị escape nhầm
     if "private_key" in info and isinstance(info["private_key"], str):
         info["private_key"] = info["private_key"].replace("\\n", "\n")
 
@@ -135,7 +130,6 @@ def safe_cell(row: list[str], index_1based: int) -> str:
 def get_row_data(sheet, row_idx: int) -> dict[str, Any]:
     row = sheet.row_values(row_idx)
     raw_photos = [safe_cell(row, col) for col in PHOTO_COLUMNS]
-    # Chuyển đổi toàn bộ link ảnh sang dạng Direct URL
     direct_photos = [convert_to_direct_image_url(p) for p in raw_photos]
     
     return {
@@ -151,14 +145,24 @@ def get_row_data(sheet, row_idx: int) -> dict[str, Any]:
 
 
 def write_status(sheet, row_idx: int, status: str, content: str | None = None):
-    # Cột G: Trạng thái
-    sheet.update_cell(row_idx, COL_STATUS, status)
-    # Cột H: Nội dung AI
-    if content is not None:
-        sheet.update_cell(row_idx, COL_AI_CONTENT, content)
-    # Cột J: Ngày đăng
-    if status == STATUS_POSTED:
-        sheet.update_cell(row_idx, COL_POSTED_AT, now_string())
+    """
+    Cập nhật trạng thái và nội dung bằng phương thức dải ô liên tục (G đến J)
+    để tối ưu số lần gọi API Google Sheets.
+    """
+    # Lấy dữ liệu hiện tại của hàng để giữ nguyên các ô không thay đổi
+    row_vals = sheet.row_values(row_idx)
+    current_content = safe_cell(row_vals, COL_AI_CONTENT)
+    current_posted_at = safe_cell(row_vals, COL_POSTED_AT)
+
+    new_content = content if content is not None else current_content
+    new_posted_at = now_string() if status == STATUS_POSTED else current_posted_at
+    col_i_val = safe_cell(row_vals, 9)  # Cột I (nếu có dữ liệu)
+
+    # Cập nhật một lần cho dải ô G{row_idx}:J{row_idx}
+    sheet.update(
+        range_name=f"G{row_idx}:J{row_idx}",
+        values=[[status, new_content, col_i_val, new_posted_at]]
+    )
 
 
 # -------------------- SOẠN NỘI DUNG VỚI GEMINI --------------------
@@ -167,12 +171,9 @@ def generate_post_content(topic: str) -> str:
     api_key = get_required_secret("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
-    # 1. Ép sạch dữ liệu đầu vào của chủ đề (topic) sang chuỗi UTF-8 chuẩn
-    topic_cleaned = str(topic).encode("utf-8", errors="ignore").decode("utf-8")
-
     prompt = f"""
 Bạn là chuyên gia sáng tạo nội dung cho Facebook Fanpage.
-Hãy viết một bài đăng bằng tiếng Việt về chủ đề: "{topic_cleaned}".
+Hãy viết một bài đăng bằng tiếng Việt về chủ đề: "{topic}".
 
 Yêu cầu chi tiết:
 - Tiêu đề thu hút, lôi cuốn nhưng chuẩn xác.
@@ -186,27 +187,22 @@ Yêu cầu chi tiết:
 """
 
     try:
-        # Cách 1: Gửi chuỗi nội dung thông thường sau khi đã chuẩn hóa
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt.encode("utf-8", errors="ignore").decode("utf-8"),
+            contents=prompt,
         )
         text = getattr(response, "text", None)
         if not text or not text.strip():
             raise RuntimeError("Gemini không trả về nội dung.")
         return text.strip()
         
-    except (UnicodeEncodeError, Exception):
-        # Cách 2 (Tối cao): Nếu môi trường ASCII vẫn chặn dữ liệu chuỗi (String),
-        # Ta chuyển đổi nội dung Prompt thành định dạng nội dung thô (Part / Blob) bằng dữ liệu Byte (bytes)
-        # Cách này ép SDK Google xử lý nhị phân, không phụ thuộc vào bảng mã của máy tính.
+    except Exception:
+        # Dự phòng gửi dạng Binary Part nếu môi trường gặp vấn đề encode
         from google.genai import types
-        
         blob_prompt = types.Part.from_bytes(
             data=prompt.encode("utf-8", errors="surrogateescape"),
             mime_type="text/plain"
         )
-        
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[blob_prompt],
@@ -216,13 +212,13 @@ Yêu cầu chi tiết:
             raise RuntimeError("Gemini không trả về nội dung.")
         return text.strip()
 
+
 # -------------------- ĐĂNG BÀI LÊN FACEBOOK (4 ẢNH) --------------------
 
 def post_to_facebook(content: str, photo_links: list[str]) -> dict[str, Any]:
     page_id = get_required_secret("FB_PAGE_ID")
     access_token = get_required_secret("FB_PAGE_ACCESS_TOKEN")
 
-    # Lọc lấy các link hợp lệ đã qua bóc tách trực tiếp
     photos = [convert_to_direct_image_url(url) for url in photo_links if url and url.strip()]
     if len(photos) != 4:
         return {
@@ -234,7 +230,6 @@ def post_to_facebook(content: str, photo_links: list[str]) -> dict[str, Any]:
     attached_media: list[dict[str, str]] = []
     upload_url = f"https://graph.facebook.com/{FB_GRAPH_VERSION}/{page_id}/photos"
 
-    # Tải từng ảnh lên Facebook ở chế độ chưa công khai (published=false)
     for number, url in enumerate(photos, start=1):
         try:
             response = requests.post(
@@ -264,7 +259,6 @@ def post_to_facebook(content: str, photo_links: list[str]) -> dict[str, Any]:
                 "error": f"Lỗi khi tải ảnh {number}/4: {exc}",
             }
 
-    # Đăng bài viết chính lên feed kèm 4 ảnh vừa tải
     feed_url = f"https://graph.facebook.com/{FB_GRAPH_VERSION}/{page_id}/feed"
     payload: dict[str, str] = {
         "message": content,
@@ -291,21 +285,16 @@ def post_to_facebook(content: str, photo_links: list[str]) -> dict[str, Any]:
         }
 
 
-# -------------------- HÀM THỰC THI ĐĂNG TRỰC TIẾP TỪ DASHBOARD --------------------
+# -------------------- HÀM THỰC THI ĐĂNG BÀI --------------------
 
 def execute_publish_row(sheet, row_idx: int, custom_content: str | None = None) -> dict[str, Any]:
-    """
-    Hàm dùng chung để thực hiện đăng ngay 1 dòng bất kỳ lên Facebook từ Dashboard.
-    """
     item = get_row_data(sheet, row_idx)
     topic = item["topic"]
     if not topic:
         return {"ok": False, "error": "Dòng này không có chủ đề."}
 
-    # Đánh dấu trạng thái đang đăng để tránh bấm lặp
     write_status(sheet, row_idx, STATUS_POSTING)
 
-    # Ưu tiên lấy nội dung chỉnh sửa trên form, sau đó đến nội dung cũ trên sheet, nếu chưa có thì gọi Gemini tạo mới
     content = (custom_content or item["content"] or "").strip()
     if not content:
         try:
@@ -418,9 +407,14 @@ async def send_telegram_approval(row_idx: int, topic: str, content: str, photo_l
     message_text = (
         f"🔔 YÊU CẦU DUYỆT BÀI — Dòng {row_idx}\n\n"
         f"📌 Chủ đề: {topic}\n\n"
-        f"📝 Nội dung do Gemini soạn:\n{content}\n\n"
-        f"🖼 Danh sách 4 ảnh (Direct Link):\n{photo_text or '(Chưa có link ảnh)'}"
+        f"📝 Nội dung:\n{content}\n\n"
+        f"🖼 Danh sách 4 ảnh:\n{photo_text or '(Chưa có link ảnh)'}"
     )
+    
+    # Cắt an toàn nếu nội dung vượt quá giới hạn 4096 ký tự của Telegram
+    if len(message_text) > 4000:
+        message_text = message_text[:3990] + "\n\n...(đã rút gọn)..."
+
     keyboard = InlineKeyboardMarkup(
         [[
             InlineKeyboardButton("✅ Duyệt & Đăng ngay", callback_data=f"approve:{row_idx}"),
@@ -429,12 +423,12 @@ async def send_telegram_approval(row_idx: int, topic: str, content: str, photo_l
     )
     await bot.send_message(
         chat_id=expected_chat_id(),
-        text=message_text[:4000],
+        text=message_text,
         reply_markup=keyboard,
     )
 
 
-# -------------------- TIẾN TRÌNH QUÉT HÀNG ĐỢI LÚC 09:00 SÁNG --------------------
+# -------------------- HÀNG ĐỢI XỬ LÝ --------------------
 
 def find_next_pending_row(sheet) -> tuple[int, dict[str, Any]] | None:
     records = sheet.get_all_values()
@@ -447,32 +441,29 @@ def find_next_pending_row(sheet) -> tuple[int, dict[str, Any]] | None:
     return None
 
 
-def daily_job():
-    logger.info("Bắt đầu quét hàng đợi...")
+def trigger_approval_job():
+    """Hàm tạo nội dung bằng Gemini và đẩy bài chờ sang Telegram để người dùng duyệt."""
+    sheet = get_sheet()
+    pending = find_next_pending_row(sheet)
+    if not pending:
+        return False, "Không có bài nào đang ở trạng thái 'Chờ xử lý'."
+
+    row_idx, item = pending
+    write_status(sheet, row_idx, STATUS_POSTING)
     try:
-        sheet = get_sheet()
-        pending = find_next_pending_row(sheet)
-        if not pending:
-            logger.info("Không có bài nào đang chờ đăng.")
-            return
-
-        row_idx, item = pending
-        write_status(sheet, row_idx, STATUS_POSTING)
-        try:
-            content = generate_post_content(item["topic"])
-            write_status(sheet, row_idx, STATUS_WAITING, content)
-            asyncio.run(
-                send_telegram_approval(row_idx, item["topic"], content, item["photos"])
-            )
-            logger.info("Đã gửi bài dòng %s sang Telegram chờ duyệt.", row_idx)
-        except Exception:
-            logger.exception("Lỗi khi tạo nội dung hoặc gửi duyệt bài dòng %s", row_idx)
-            write_status(sheet, row_idx, STATUS_ERROR)
-    except Exception:
-        logger.exception("daily_job gặp lỗi.")
+        content = generate_post_content(item["topic"])
+        write_status(sheet, row_idx, STATUS_WAITING, content)
+        asyncio.run(
+            send_telegram_approval(row_idx, item["topic"], content, item["photos"])
+        )
+        return True, f"Đã gửi bài dòng {row_idx} sang Telegram chờ duyệt."
+    except Exception as e:
+        logger.exception("Lỗi khi tạo nội dung hoặc gửi duyệt bài dòng %s", row_idx)
+        write_status(sheet, row_idx, STATUS_ERROR)
+        return False, f"Lỗi xử lý dòng {row_idx}: {e}"
 
 
-# -------------------- DỊCH VỤ NỀN TELEGRAM VÀ SCHEDULER --------------------
+# -------------------- DỊCH VỤ TELEGRAM LISTENER --------------------
 
 def telegram_thread_main(stop_event: threading.Event):
     async def runner():
@@ -501,21 +492,7 @@ def telegram_thread_main(stop_event: threading.Event):
 
 
 @st.cache_resource
-def start_background_services():
-    scheduler = BackgroundScheduler(timezone=TIMEZONE)
-    scheduler.add_job(
-        daily_job,
-        trigger="cron",
-        hour=9,
-        minute=0,
-        id="daily_fanpage_post",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=3600,
-    )
-    scheduler.start()
-
+def start_telegram_bot():
     stop_event = threading.Event()
     bot_thread = threading.Thread(
         target=telegram_thread_main,
@@ -524,17 +501,17 @@ def start_background_services():
         daemon=True,
     )
     bot_thread.start()
-    return scheduler, stop_event, bot_thread
+    return stop_event, bot_thread
 
 
 # -------------------- GIAO DIỆN STREAMLIT DASHBOARD --------------------
 
 st.set_page_config(
-    page_title="Auto Post Facebook Fanpage",
+    page_title="Hệ Thống Đăng Bài Fanpage",
     page_icon="🚀",
     layout="wide",
 )
-st.title("🚀 Hệ thống Tự Động Đăng Bài Fanpage (Gemini + Telegram + Sheets)")
+st.title("🚀 Quản Lý Đăng Bài Fanpage (Gemini + Telegram + Sheets)")
 
 with st.expander("⚙️ Kiểm tra cấu hình Secrets", expanded=False):
     required_names = [
@@ -553,22 +530,21 @@ with st.expander("⚙️ Kiểm tra cấu hình Secrets", expanded=False):
         st.success("Tất cả cấu hình bảo mật đã sẵn sàng!")
 
 try:
-    scheduler, telegram_stop_event, telegram_thread = start_background_services()
-    st.success("✅ Hệ thống hẹn giờ đang hoạt động: Tự động chạy vào lúc **09:00 AM** mỗi ngày (Asia/Ho_Chi_Minh).")
+    telegram_stop_event, telegram_thread = start_telegram_bot()
 except Exception as exc:
-    st.error(f"Không thể khởi động dịch vụ nền: {exc}")
+    st.error(f"Không thể khởi động dịch vụ Telegram: {exc}")
 
 top1, top2, top3 = st.columns(3)
 top1.metric("Giờ hệ thống", datetime.now(TIMEZONE).strftime("%H:%M:%S"))
 top2.metric("Ngày hiện tại", datetime.now(TIMEZONE).strftime("%d/%m/%Y"))
-top3.metric("Telegram Listener", "Đang chạy" if "telegram_thread" in locals() and telegram_thread.is_alive() else "Dừng")
+top3.metric("Telegram Bot Duyệt Bài", "Đang chạy" if "telegram_thread" in locals() and telegram_thread.is_alive() else "Dừng")
 
 left, right = st.columns([1, 1])
 with left:
-    st.subheader("🧪 Điều khiển thủ công")
+    st.subheader("🧪 Điều khiển tác vụ")
     
-    # Nút 1: Đăng ngay dòng kế tiếp đang chờ (bỏ qua lịch 9h)
-    if st.button("⚡ Đăng ngay bài kế tiếp đang chờ xử lý", type="primary", use_container_width=True):
+    # Nút 1: Đăng trực tiếp bài tiếp theo lên Fanpage
+    if st.button("⚡ Đăng trực tiếp bài kế tiếp lên Facebook", type="primary", use_container_width=True):
         with st.spinner("Đang tìm bài chờ và đăng trực tiếp lên Facebook..."):
             s = get_sheet()
             pending = find_next_pending_row(s)
@@ -583,19 +559,24 @@ with left:
                 else:
                     st.error(f"❌ Đăng thất bại: {res['error']}")
 
-    if st.button("▶️ Chạy thử quy trình gửi Telegram (Test Run)", use_container_width=True):
-        with st.spinner("Đang tìm bài, viết nội dung và gửi Telegram..."):
-            daily_job()
-        st.success("Đã hoàn tất! Vui lòng kiểm tra bot Telegram để duyệt bài.")
+    # Nút 2: Soạn bài và gửi sang Telegram để người dùng duyệt
+    if st.button("📩 Tạo bài & Gửi duyệt qua Telegram", use_container_width=True):
+        with st.spinner("Đang viết nội dung và gửi tin nhắn Telegram..."):
+            ok, msg = trigger_approval_job()
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
         st.rerun()
 
     if st.button("🔄 Tải lại dữ liệu Google Sheets", use_container_width=True):
         st.rerun()
 
 with right:
-    st.subheader("📌 Nguyên tắc hoạt động")
-    st.write("- Đúng **09:00**, lấy 1 dòng chưa đăng gửi qua Telegram chờ duyệt.")
-    st.write("- Hoặc bạn có thể bấm **Đăng ngay bài kế tiếp** / chọn bài viết bên dưới rồi nhấn **Đăng bài này ngay** để đăng trực tiếp lên Facebook bất kỳ lúc nào.")
+    st.subheader("📌 Hướng dẫn sử dụng")
+    st.write("- **Đăng trực tiếp:** Lấy dòng 'Chờ xử lý' đầu tiên, gọi Gemini viết bài và đẩy thẳng lên Facebook Fanpage.")
+    st.write("- **Tạo bài & Gửi duyệt:** Gemini sẽ viết bài trước rồi gửi kèm 4 link ảnh sang Telegram. Khi bạn nhấn 'Duyệt & Đăng ngay' trên bot Telegram, bài viết mới được đăng lên Fanpage.")
+    st.write("- **Chỉnh sửa thủ công:** Chọn bài viết trong danh sách phía dưới để chỉnh sửa nội dung hoặc xem trước 4 ảnh.")
 
 st.divider()
 st.subheader("📋 Bảng quản lý bài đăng")
@@ -633,7 +614,7 @@ try:
                 f"Dòng {int(row['Dòng'])} — {row['Chủ đề'] or '(Chưa có chủ đề)'} [{row['Trạng thái'] or 'Chờ xử lý'}]": int(row["Dòng"])
                 for _, row in df.iterrows()
             }
-            selected_label = st.selectbox("Chọn bài viết để kiểm tra nội dung, 4 ảnh hoặc ĐĂNG NGAY:", list(row_options.keys()))
+            selected_label = st.selectbox("Chọn bài viết để kiểm tra hoặc đăng ngay:", list(row_options.keys()))
             selected_row_idx = row_options[selected_label]
             selected = get_row_data(sheet, selected_row_idx)
 
@@ -642,13 +623,13 @@ try:
 
             st.markdown("#### Nội dung soạn thảo")
             post_content = st.text_area(
-                "Nội dung bài viết (Có thể chỉnh sửa trực tiếp trước khi nhấn Đăng):",
+                "Nội dung bài viết (Có thể chỉnh sửa trước khi nhấn Đăng):",
                 value=selected["content"],
-                height=250,
+                height=220,
                 key=f"content_{selected_row_idx}"
             )
 
-            st.markdown("#### 🖼️ Xem trước 4 ảnh sau khi tự động bóc tách link")
+            st.markdown("#### 🖼️ Xem trước 4 ảnh")
             image_cols = st.columns(4)
             for i, (col, url) in enumerate(zip(image_cols, selected["photos"]), start=1):
                 with col:
@@ -664,7 +645,6 @@ try:
                         st.info("Chưa có URL ảnh")
 
             st.write("")
-            # NÚT ĐĂNG BÀI NGAY DÀNH CHO DÒNG ĐANG CHỌN
             col_btn1, col_btn2 = st.columns([1, 2])
             with col_btn1:
                 if st.button(f"🚀 Đăng bài dòng {selected_row_idx} ngay lên Fanpage", type="primary", use_container_width=True):
