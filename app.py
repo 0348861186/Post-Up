@@ -8,7 +8,10 @@ import threading
 import time
 from datetime import datetime
 from typing import Any
-
+# ---- CHÈN ĐOẠN NÀY VÀO ĐÂY ĐỂ SỬA LỖI ASCII CHỮ Đ ----
+import os
+os.environ["PYTHONUTF8"] = "1"
+# ----------------------------------------------------
 import gspread
 import pandas as pd
 import pytz
